@@ -18,16 +18,8 @@ def _get_sbert_device() -> str:
 
 
 def get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            device = _get_sbert_device()
-            logger.info("Initializing SentenceTransformer lazily on device=%s...", device)
-            _embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
-        except Exception as e:
-            logger.error(f"Error loading embedding model: {e}")
-    return _embedding_model
+    from core.vector_db import _get_search_model
+    return _get_search_model()
 
 def run_ocr_pipeline(filepath, job_id=None):
     """

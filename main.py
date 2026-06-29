@@ -1,16 +1,17 @@
 import os
 from pathlib import Path
 
-# Enable offline mode only if the embedding model is already cached to prevent startup errors on first run.
-hf_cache = Path(os.path.expanduser("~/.cache/huggingface/hub"))
-model_cached = hf_cache.exists() and any(hf_cache.glob("*all-MiniLM-L6-v2*"))
-
-if model_cached:
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_DATASETS_OFFLINE"] = "1"
-else:
-    os.environ["TRANSFORMERS_OFFLINE"] = "0"
-    os.environ["HF_DATASETS_OFFLINE"] = "0"
+# On Render, skip offline mode so the model can be downloaded
+on_render = os.environ.get("RENDER", "") == "true"
+if not on_render:
+    hf_cache = Path(os.path.expanduser("~/.cache/huggingface/hub"))
+    model_cached = hf_cache.exists() and any(hf_cache.glob("*all-MiniLM-L6-v2*"))
+    if model_cached:
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+    else:
+        os.environ["TRANSFORMERS_OFFLINE"] = "0"
+        os.environ["HF_DATASETS_OFFLINE"] = "0"
 
 import logging
 from contextlib import asynccontextmanager
@@ -30,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 
 def ensure_ollama_running():
+    """Only needed when using local Ollama provider."""
+    if settings.llm_provider != "ollama":
+        logger.info(f"LLM provider is '{settings.llm_provider}' — skipping Ollama startup check.")
+        return True
+
     import socket
     import subprocess
     import time
@@ -94,18 +100,51 @@ def ensure_ollama_running():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
-    import asyncio, requests as _req
+    import asyncio
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
 
-    # Ensure Ollama is running
-    await asyncio.to_thread(ensure_ollama_running)
+    # Only ensure Ollama is running if using local provider
+    if settings.llm_provider == "ollama":
+        await asyncio.to_thread(ensure_ollama_running)
+        logger.info(f"Ollama model: {settings.ollama_model}")
+    else:
+        logger.info(f"LLM provider: {settings.llm_provider}/{settings.llm_model}")
 
-    logger.info(f"Ollama model: {settings.ollama_model}")
     logger.info(f"Qdrant: {settings.qdrant_url}")
 
-    # Step 1: Pre-load the SentenceTransformer on CPU first (before Ollama loads its model).
-    # This prevents the TDR crash where both load simultaneously and the GPU scheduler
-    # resets due to unresponsiveness, killing Ollama's CUDA context.
+    # Pre-load embeddings lazily — download/fail in background, don't block startup
+    asyncio.create_task(_preload_embeddings())
+
+    # Warm up Ollama only when using local provider
+    if settings.llm_provider == "ollama":
+        try:
+            import requests as _req
+            logger.info(f"Warming up Ollama ({settings.ollama_model})...")
+            warmup = await asyncio.to_thread(
+                lambda: _req.post(
+                    settings.ollama_url,
+                    json={"model": settings.ollama_model, "prompt": "OK", "stream": False,
+                          "options": {"num_predict": 1, "num_ctx": settings.ollama_num_ctx}},
+                    timeout=120,
+                )
+            )
+            if warmup.status_code == 200:
+                logger.info("Ollama warmed up — model loaded in VRAM.")
+            else:
+                logger.warning(f"Ollama warmup returned {warmup.status_code}")
+        except Exception as e:
+            logger.warning(f"Ollama warmup failed (non-fatal, will retry on first request): {e}")
+
+    yield
+    logger.info("Shutting down...")
+
+
+async def _preload_embeddings():
+    """Pre-load embedding model in the background so it doesn't block startup."""
+    if on_render:
+        logger.info("Running on Render — skipping SentenceTransformer pre-load to conserve memory.")
+        return
+    import asyncio
     try:
         import torch
         device = settings.embedding_device
@@ -116,30 +155,7 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(_get_search_model)
         logger.info("SentenceTransformer ready.")
     except Exception as e:
-        logger.warning(f"Embedding model pre-load failed (non-fatal): {e}")
-
-    # Step 2: Warm up Ollama — send a tiny generate request so qwen2.5:7b is already
-    # loaded in VRAM when the first analyze request arrives (avoids cold-start race).
-    try:
-        logger.info(f"Warming up Ollama ({settings.ollama_model})...")
-        warmup = await asyncio.to_thread(
-            lambda: _req.post(
-                settings.ollama_url,
-                json={"model": settings.ollama_model, "prompt": "OK", "stream": False,
-                      "options": {"num_predict": 1, "num_ctx": settings.ollama_num_ctx}},
-                timeout=120,
-            )
-        )
-        if warmup.status_code == 200:
-            logger.info("Ollama warmed up — model loaded in VRAM.")
-        else:
-            logger.warning(f"Ollama warmup returned {warmup.status_code}")
-    except Exception as e:
-        logger.warning(f"Ollama warmup failed (non-fatal, will retry on first request): {e}")
-
-    yield
-    logger.info("Shutting down...")
-
+        logger.warning(f"Embedding model pre-load failed (non-fatal, will load on first request): {e}")
 
 
 app = FastAPI(
@@ -164,6 +180,7 @@ def root():
     if react_index.exists():
         return FileResponse(react_index)
     return FileResponse("static/index.html")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -205,16 +222,23 @@ def health_check():
     except Exception:
         services["qdrant"] = "unhealthy"
     
-    # Check Ollama
-    try:
-        import requests
-        resp = requests.get("http://localhost:11434/api/tags", timeout=3)
-        if resp.status_code == 200:
-            services["ollama"] = "healthy"
-        else:
+    # Check LLM provider
+    if settings.llm_provider == "ollama":
+        try:
+            import requests
+            resp = requests.get("http://localhost:11434/api/tags", timeout=3)
+            if resp.status_code == 200:
+                services["ollama"] = "healthy"
+            else:
+                services["ollama"] = "unhealthy"
+        except Exception:
             services["ollama"] = "unhealthy"
-    except Exception:
-        services["ollama"] = "unhealthy"
+    else:
+        # Groq API health check — key configured = healthy (no rate-limit calls needed)
+        if settings.llm_api_key:
+            services["groq"] = "healthy"
+        else:
+            services["groq"] = "unhealthy"
     
     overall = "healthy" if all(v == "healthy" for v in services.values()) else "degraded"
     

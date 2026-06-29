@@ -8,10 +8,12 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 from celery import Celery
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
 celery_app = Celery(
     "ocr_worker",
-    broker = "redis://localhost:6379/0",
-    backend = "redis://localhost:6379/0",
+    broker = REDIS_URL,
+    backend = REDIS_URL,
     include = ["tasks.pipeline_tasks"]
 )
 

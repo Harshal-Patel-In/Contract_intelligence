@@ -1,8 +1,11 @@
 import logging
 import re
 import requests
+import asyncio
+from typing import AsyncGenerator
 
 from core.config import settings
+from models.groq_llm import _query_groq, _query_groq_stream_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,36 @@ CATEGORY_HINTS = {
         "State who owns what and any license-back provisions."
     ),
 }
+
+
+def _query_llm(prompt: str) -> str | None:
+    """
+    Route the query to the configured LLM provider.
+    Supports 'groq' (free API) and 'ollama' (local).
+    """
+    if settings.llm_provider == "groq":
+        return _query_groq(prompt, SYSTEM_PROMPT)
+    return _query_ollama(prompt)
+
+
+async def _query_llm_stream(
+    prompt: str,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
+) -> AsyncGenerator[str, None]:
+    """Stream the query from the configured LLM provider."""
+    if settings.llm_provider == "groq":
+        async for token in _query_groq_stream_with_retry(
+            prompt, SYSTEM_PROMPT, max_retries, retry_delay
+        ):
+            yield token
+    else:
+        # For non-streaming ollama fallback, yield the full response
+        result = _query_ollama(prompt)
+        if result:
+            yield result
+        else:
+            yield "NOT_FOUND"
 
 
 def _query_ollama(prompt: str) -> str:
@@ -218,7 +251,7 @@ def _compute_confidence(answer: str, query: str, category: str) -> float:
 
 def answer_question(query: str, chunks: list, category: str = "") -> dict:
     """
-    Uses Ollama to extract answers from contract chunks.
+    Uses configured LLM (Groq or Ollama) to extract answers from contract chunks.
 
     Builds a category-aware prompt with extraction hints and chain-of-thought
     reasoning for precise clause extraction.
@@ -259,12 +292,12 @@ CONTRACT TEXT:
 
 ANSWER:"""
 
-    logger.info(f"[QA] Querying {settings.ollama_model} for: {query[:60]}")
+    logger.info(f"[QA] Querying {settings.llm_provider}/{settings.llm_model} for: {query[:60]}")
 
-    raw_answer = _query_ollama(prompt)
+    raw_answer = _query_llm(prompt)
 
     if raw_answer is None:
-        return {"answer": None, "score": 0.0, "error": "Ollama not available"}
+        return {"answer": None, "score": 0.0, "error": f"{settings.llm_provider} not available"}
 
     answer = raw_answer.strip()
 

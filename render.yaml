@@ -1,0 +1,57 @@
+# Render Blueprint — Deploy the contract intelligence backend
+# https://render.com/docs/blueprint-spec
+# 
+# This deploys:
+#   1. FastAPI web service (Python)
+#   2. Redis (for Celery + cache)
+#
+# Qdrant runs in local (in-memory) mode via qdrant-client Python library,
+# so no separate Qdrant Docker service is needed.
+#
+# IMPORTANT: Set LLM_API_KEY in Render dashboard (get free key at https://console.groq.com)
+
+services:
+  - type: web
+    name: contract-intelligence-api
+    env: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install fastapi[standard] uvicorn pydantic-settings redis qdrant-client celery httpx requests python-multipart python-docx pymupdf pillow langdetect numpy sentence-transformers
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # --- LLM Provider (Groq = free, no GPU needed) ---
+      - key: LLM_PROVIDER
+        value: groq
+      - key: LLM_MODEL
+        value: llama-3.3-70b-versatile
+      - key: LLM_API_KEY
+        sync: false  # ⚠️  SET THIS MANUALLY in Render dashboard
+      # --- Redis (auto-linked by Render) ---
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: contract-redis
+          property: connectionString
+      # --- Qdrant (local mode on disk) ---
+      - key: QDRANT_URL
+        value: ""
+      # Render free tier cannot write to /var/data — use temp dir
+      - key: QDRANT_LOCAL_PATH
+        value: /tmp/qdrant
+      # --- Hardware settings ---
+      - key: EMBEDDING_DEVICE
+        value: cpu
+      - key: OCR_USE_GPU
+        value: false
+      - key: DEBUG
+        value: false
+
+  - type: redis
+    name: contract-redis
+    plan: free
+    maxmemoryPolicy: noeviction
+    ipAllowList: []  # Allow only internal connections from other Render services

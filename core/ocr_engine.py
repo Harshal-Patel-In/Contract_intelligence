@@ -6,17 +6,34 @@ os.environ["FLAGS_allocator_strategy"] = "auto_growth"
 os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = os.getenv("FLAGS_fraction_of_gpu_memory_to_use", "0.1")
 
 import logging
-import torch
 from functools import lru_cache
-from paddleocr import PaddleOCR
 
 logger = logging.getLogger(__name__)
+
+# Lazy imports — torch and paddleocr may not be installed on lightweight deployments
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+    logger.warning("torch not installed — GPU detection disabled, using CPU fallback.")
+
+try:
+    from paddleocr import PaddleOCR
+    _HAS_PADDLEOCR = True
+except ImportError:
+    PaddleOCR = None  # type: ignore
+    _HAS_PADDLEOCR = False
+    logger.warning("paddleocr not installed — OCR functionality will be unavailable.")
 
 
 def _detect_gpu() -> bool:
     """Returns True if paddlepaddle-gpu is installed, allowed by config, and a CUDA GPU is found."""
     if not settings.ocr_use_gpu:
         logger.info("PaddleOCR: GPU disabled by configuration (ocr_use_gpu=False) — using CPU.")
+        return False
+
+    if not _HAS_TORCH:
         return False
 
     try:
@@ -54,8 +71,10 @@ _LANG_MAP: dict[str, str] = {
 
 
 @lru_cache(maxsize=16)
-def _get_engine(lang: str = "en", angle_cls: bool = False) -> PaddleOCR:
+def _get_engine(lang: str = "en", angle_cls: bool = False):
     """Returns a cached PaddleOCR engine. angle_cls=False for documents, True for raw images."""
+    if not _HAS_PADDLEOCR:
+        raise RuntimeError("PaddleOCR is not installed — OCR functionality is unavailable on this deployment.")
     logger.info("PaddleOCR: loading engine lang='%s' angle_cls=%s gpu=%s.", lang, angle_cls, USE_GPU)
     return PaddleOCR(
         use_angle_cls=angle_cls,

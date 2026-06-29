@@ -1,9 +1,10 @@
 import os
+import json
 import uuid
 import logging
+import asyncio
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from typing import List, cast
-from celery import group, Task
+from typing import List
 
 from ingestion.file_manager import save_file
 from core.redis_client import redis_client
@@ -15,6 +16,36 @@ router = APIRouter()
 
 ALLOWED_EXTENSIONS = set(settings.allowed_extensions)
 MAX_FILE_SIZE = settings.max_file_size_mb * 1024 * 1024
+
+
+def _celery_workers_available() -> bool:
+    """Check if any Celery workers are connected to the broker."""
+    try:
+        from core.celery_app import celery_app
+        inspector = celery_app.control.inspect(timeout=2)
+        active = inspector.active()
+        return bool(active)
+    except Exception:
+        return False
+
+
+def _process_file_sync(file_path: str, job_id: str):
+    """Process a single file synchronously (fallback when no Celery worker)."""
+    try:
+        from pipeline.document_pipeline import run_ocr_pipeline
+        result = run_ocr_pipeline(file_path, job_id=job_id)
+        if redis_client:
+            redis_client.rpush(
+                f"job:{job_id}:results",
+                json.dumps({"file": file_path, "result": result})
+            )
+    except Exception as e:
+        logger.error("Sync processing failed for %s: %s", file_path, e)
+        if redis_client:
+            redis_client.rpush(
+                f"job:{job_id}:results",
+                json.dumps({"file": file_path, "error": str(e)})
+            )
 
 
 @router.get("/upload")
@@ -58,30 +89,41 @@ async def upload_files(files: List[UploadFile] = File(...)):
         path = save_file(content, filename)
         file_paths.append(path)
 
-    redis_client.delete(f"job:{job_id}:results")
+    if redis_client:
+        redis_client.delete(f"job:{job_id}:results")
 
     original_filenames = [f.filename for f in files]
 
-    redis_client.hset(
-        f"job:{job_id}",
-        mapping={
-            "status": "processing",
-            "total_files": len(file_paths),
-            "filenames": ",".join(original_filenames),
-        }
-    )
+    if redis_client:
+        redis_client.hset(
+            f"job:{job_id}",
+            mapping={
+                "status": "processing",
+                "total_files": len(file_paths),
+                "filenames": ",".join(original_filenames),
+            }
+        )
+    else:
+        logger.warning("Redis not available — skipping job metadata storage")
 
-    # Lazy import: prevents PaddleOCR/torch from loading in the FastAPI process at startup.
-    # The Celery task is only dispatched here (not executed), so this import is safe.
-    from tasks.pipeline_tasks import process_single_file
-    task = cast(Task, process_single_file)
+    # Try Celery first; fall back to synchronous processing in a background thread
+    use_celery = _celery_workers_available()
 
-    task_group = group(
-        task.s(path, job_id)
-        for path in file_paths
-    )
-
-    task_group.apply_async()
+    if use_celery:
+        logger.info("Celery workers detected — dispatching tasks asynchronously.")
+        from celery import group
+        from tasks.pipeline_tasks import process_single_file
+        from typing import cast
+        from celery import Task
+        task = cast(Task, process_single_file)
+        task_group = group(task.s(path, job_id) for path in file_paths)
+        task_group.apply_async()
+    else:
+        logger.info("No Celery workers — processing files synchronously in background thread.")
+        for path in file_paths:
+            asyncio.get_event_loop().run_in_executor(
+                None, _process_file_sync, path, job_id
+            )
 
     return {
         "job_id": job_id,

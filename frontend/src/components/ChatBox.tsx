@@ -126,25 +126,14 @@ export const ChatBox: React.FC<ChatBoxProps> = ({ jobId, onClose }) => {
 
       <div className="chat-messages">
         {messages.map((msg, i) => (
-          <div key={i} className={`chat-bubble-wrapper ${msg.role} chat-bubble-enter`} style={{ animationDelay: `${Math.min(i * 0.05, 0.3)}s` }}>
-            {msg.role === 'ai' && (
-              <div className="chat-avatar">
-                <Bot size={16} />
-              </div>
-            )}
+          <div key={i} className={`chat-bubble-wrapper ${msg.role}`}>
             <div className={`chat-bubble chat-bubble-${msg.role}`}>
               {msg.text ? (
-                <div className={`markdown-body${isLoading && msg.role === 'ai' && i === messages.length - 1 ? ' streaming-text-cursor' : ''}`}>
+                <div className="markdown-body">
                   <ReactMarkdown>{msg.text}</ReactMarkdown>
                 </div>
               ) : (
-                isLoading && i === messages.length - 1 ? (
-                  <div className="typing-indicator">
-                    <span className="typing-dot"></span>
-                    <span className="typing-dot"></span>
-                    <span className="typing-dot"></span>
-                  </div>
-                ) : ''
+                isLoading && i === messages.length - 1 ? <span className="typing-dot">...</span> : ''
               )}
             </div>
           </div>
@@ -167,7 +156,7 @@ export const ChatBox: React.FC<ChatBoxProps> = ({ jobId, onClose }) => {
           onClick={handleSend}
           disabled={!input.trim() || isLoading}
         >
-          {isLoading ? <Loader2 size={18} className="spin" /> : <Send size={18} className="send-icon" />}
+          {isLoading ? <Loader2 size={18} className="spin" /> : <Send size={18} />}
         </button>
       </div>
     </div>

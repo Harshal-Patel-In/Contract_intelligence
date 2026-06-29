@@ -86,6 +86,9 @@ export const Header: React.FC = () => {
       if (data.status === 'healthy') {
         setHealth('active');
         setHealthText('Services: Active');
+      } else if (data.status === 'degraded') {
+        setHealth('active');
+        setHealthText('Services: Active');
       } else {
         setHealth('degraded');
         setHealthText('Services: Degraded');

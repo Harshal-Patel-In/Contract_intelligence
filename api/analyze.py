@@ -6,7 +6,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from core.config import settings
 from core.vector_db import search_chunks, get_chunks_by_order, get_all_chunks, keyword_search_chunks
-from models.qa_pipeline import answer_question
+from models.qa_pipeline import answer_question, _query_llm_stream, _clean_answer, _compute_confidence, CATEGORY_HINTS
 
 logger = logging.getLogger(__name__)
 
@@ -383,79 +383,38 @@ def _get_best_chunks_focused_optimized(job_id: str, category: str, question: str
     return chunks
 
 
-def _query_ollama_individual(question: str, context: str, category: str, max_retries: int = 3, retry_delay: float = 5.0) -> str:
-    """Call Ollama with retry logic for a single category to ensure robust model responses."""
-    import requests
+def _query_llm_individual(question: str, context: str, category: str, max_retries: int = 3, retry_delay: float = 5.0) -> str:
+    """
+    Call the configured LLM (Groq or Ollama) with retry logic for a single category.
+    Uses the provider-agnostic prompt builder.
+    """
     import time
-    from models.qa_pipeline import CATEGORY_HINTS
+    from models.qa_pipeline import _query_llm
 
-    SYSTEM_PROMPT_INDIVIDUAL = "You are a precise legal contract analyst. Extract the exact relevant clauses from the contract text."
-
-    hint = CATEGORY_HINTS.get(category, "")
-    hint_block = f"\nEXTRACTION HINTS: {hint}\n" if hint else ""
-
-    extra_guidelines = ""
-    if category == "Termination for Convenience":
-        extra_guidelines = (
-            "\n5. If a party has a right to terminate the contract upon notice or under certain conditions (even if "
-            "heavily redacted with [**], like eBix terminating under Section 13.1), you MUST extract this as the "
-            "Termination for Convenience clause. Do not return NOT_FOUND if such a termination clause is present."
-        )
-
-    prompt = f"""You are a professional legal contract analyst. Extract the answer to the question below from the contract text.
-If the information is genuinely not present in the text, respond with exactly: NOT_FOUND.
-{hint_block}
-Think step by step: first identify the relevant clauses or sections, then extract the specific answer.
-
-IMPORTANT GUIDELINES:
-1. Provide a direct quote or the exact text from the contract. Do not summarize unless necessary.
-2. If a clause is present but contains redacted placeholders (like [**]), you must still extract the clause.
-3. If a clause uses different terminology (e.g. 'assign' or 'transfer' for assignment, 'exclusivity' or 'proprietary' or 'ownership of data' for IP ownership, 'terminate... without cause' or 'terminate... upon notice' for termination for convenience), you must still extract it.{extra_guidelines}
-4. Do not return NOT_FOUND if there is a clause that addresses the general topic of the question.
-
-QUESTION: {question}
-
-CONTRACT TEXT:
-{context}
-
-ANSWER:"""
+    prompt = _build_streaming_prompt(question, context, category)
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = requests.post(
-                settings.ollama_url,
-                json={
-                    "model": settings.ollama_model,
-                    "prompt": prompt,
-                    "system": SYSTEM_PROMPT_INDIVIDUAL,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.0,
-                        "num_ctx": settings.ollama_num_ctx,
-                    }
-                },
-                timeout=150
-            )
-            response.raise_for_status()
-            return response.json().get("response", "").strip()
+            result = _query_llm(prompt)
+            if result is not None:
+                return result
+            logger.warning(f"LLM query returned None for {category} (attempt {attempt}/{max_retries})")
         except Exception as e:
-            logger.warning(f"Ollama individual query error for {category} (attempt {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
-            else:
-                logger.error(f"Ollama individual query failed after {max_retries} attempts.")
-                return "NOT_FOUND"
+            logger.warning(f"LLM query error for {category} (attempt {attempt}/{max_retries}): {e}")
+        
+        if attempt < max_retries:
+            logger.info(f"Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+        else:
+            logger.error(f"LLM query failed after {max_retries} attempts for {category}.")
+            return "NOT_FOUND"
+    
+    return "NOT_FOUND"
 
 
-async def _query_ollama_individual_stream(question: str, context: str, category: str, max_retries: int = 3, retry_delay: float = 5.0, history: list = None):
-    """Call Ollama with streaming enabled and retry logic, yielding text chunks in real-time."""
-    import httpx
-    import json
-    import asyncio
+def _build_streaming_prompt(question: str, context: str, category: str, history: list = None) -> str:
+    """Build the prompt for streaming LLM calls, supporting both category extraction and chat."""
     from models.qa_pipeline import CATEGORY_HINTS
-
-    SYSTEM_PROMPT_INDIVIDUAL = "You are a precise legal contract analyst. Extract the exact relevant clauses from the contract text."
 
     hint = CATEGORY_HINTS.get(category, "")
     hint_block = f"\nEXTRACTION HINTS: {hint}\n" if hint else ""
@@ -506,38 +465,7 @@ CONTRACT TEXT:
 {context}
 
 ANSWER:"""
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=150.0) as client:
-                async with client.stream(
-                    "POST",
-                    settings.ollama_url,
-                    json={
-                        "model": settings.ollama_model,
-                        "prompt": prompt,
-                        "system": SYSTEM_PROMPT_INDIVIDUAL,
-                        "stream": True,
-                        "options": {
-                            "temperature": 0.0,
-                            "num_ctx": settings.ollama_num_ctx,
-                        }
-                    }
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if line:
-                            chunk = json.loads(line)
-                            yield chunk.get("response", "")
-            return
-        except Exception as e:
-            logger.warning(f"Ollama streaming query error for {category} (attempt {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in {retry_delay}s...")
-                await asyncio.sleep(retry_delay)
-            else:
-                logger.error(f"Ollama streaming query failed after {max_retries} attempts.")
-                yield "NOT_FOUND"
+    return prompt
 
 
 @router.get("/analyze/stream/{job_id}")
@@ -609,9 +537,10 @@ async def analyze_contract_stream(job_id: str):
                             context_parts.append(txt)
                     context = "\n\n---\n\n".join(context_parts)
 
-                # Query Ollama with streaming
+                # Query LLM with streaming (Groq or Ollama)
                 raw_res_parts = []
-                async for text_chunk in _query_ollama_individual_stream(question, context, cat):
+                stream_prompt = _build_streaming_prompt(question, context, cat)
+                async for text_chunk in _query_llm_stream(stream_prompt, max_retries=3, retry_delay=5.0):
                     raw_res_parts.append(text_chunk)
                     yield f"data: {json.dumps({'status': 'chunk', 'category': cat, 'text': text_chunk})}\n\n"
                     await asyncio.sleep(0.001)
@@ -797,8 +726,8 @@ async def analyze_contract(job_id: str):
                     context_parts.append(txt)
             context = "\n\n---\n\n".join(context_parts)
 
-        # Call Ollama for individual category
-        raw_res = await asyncio.to_thread(_query_ollama_individual, question, context, cat)
+        # Call LLM for individual category (Groq or Ollama)
+        raw_res = await asyncio.to_thread(_query_llm_individual, question, context, cat)
         
         # Smart refusal detection
         is_refusal = False
@@ -970,7 +899,8 @@ async def chat_contract_stream(job_id: str, request: ChatRequest):
 
             yield f"data: {json.dumps({'status': 'start'})}\n\n"
             
-            async for text_chunk in _query_ollama_individual_stream(question, context, "Chat", history=request.history):
+            stream_prompt = _build_streaming_prompt(question, context, "Chat", history=request.history)
+            async for text_chunk in _query_llm_stream(stream_prompt, max_retries=3, retry_delay=5.0):
                 yield f"data: {json.dumps({'status': 'chunk', 'text': text_chunk})}\n\n"
                 
             yield f"data: {json.dumps({'status': 'done'})}\n\n"

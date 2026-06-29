@@ -6,10 +6,20 @@ from qdrant_client.models import VectorParams, Distance
 logger = logging.getLogger(__name__)
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_LOCAL_PATH = os.getenv("QDRANT_LOCAL_PATH", "")
 COLLECTION_NAME = "contracts"
 VECTOR_SIZE = 384  # all-MiniLM-L6-v2
 
-client = QdrantClient(url=QDRANT_URL)
+if QDRANT_URL:
+    logger.info(f"Connecting to Qdrant at {QDRANT_URL}")
+    client = QdrantClient(url=QDRANT_URL)
+elif QDRANT_LOCAL_PATH:
+    logger.info(f"Using local Qdrant storage at {QDRANT_LOCAL_PATH}")
+    os.makedirs(QDRANT_LOCAL_PATH, exist_ok=True)
+    client = QdrantClient(path=QDRANT_LOCAL_PATH)
+else:
+    logger.info("Using in-memory Qdrant (data lost on restart)")
+    client = QdrantClient(":memory:")
 
 def _get_sbert_device() -> str:
     try:
@@ -75,15 +85,98 @@ def insert_chunks(chunks_with_embeddings: list[dict], metadata: dict):
     return True
 
 
+def _log_error_to_redis(err_msg: str):
+    try:
+        from core.redis_client import redis_client
+        if redis_client:
+            redis_client.set("hf_api_error", err_msg)
+    except Exception:
+        pass
+
+
+class HFInferenceEmbeddingModel:
+    def __init__(self):
+        self.local_model = None
+        self.use_api = True
+        self.hf_token = os.getenv("HF_TOKEN")
+        self.fallback_to_local = not os.getenv("RENDER")
+
+    def encode(self, texts, show_progress_bar=False):
+        import numpy as np
+        import time
+        if isinstance(texts, str):
+            single = True
+            texts = [texts]
+        else:
+            single = False
+
+        if self.use_api:
+            try:
+                import requests
+                headers = {}
+                if self.hf_token and self.hf_token.startswith("hf_"):
+                    headers["Authorization"] = f"Bearer {self.hf_token}"
+                
+                logger.info(f"Generating embedding via HF Inference API for {len(texts)} texts...")
+                
+                max_hf_retries = 5
+                response = None
+                for hf_attempt in range(max_hf_retries):
+                    response = requests.post(
+                        "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+                        json={"inputs": texts},
+                        headers=headers,
+                        timeout=15
+                    )
+                    if response.status_code == 200:
+                        embeddings = response.json()
+                        if isinstance(embeddings, list) and len(embeddings) > 0:
+                            if isinstance(embeddings[0], float):
+                                embeddings = [embeddings]
+                            logger.info("Successfully fetched embedding from HF Inference API.")
+                            if single:
+                                return np.array(embeddings[0])
+                            return np.array(embeddings)
+                    elif response.status_code == 503:
+                        try:
+                            err_data = response.json()
+                            est_time = err_data.get("estimated_time", 5.0)
+                        except Exception:
+                            est_time = 5.0
+                        logger.info(f"HF model is loading. Waiting {est_time}s before retry (attempt {hf_attempt+1}/{max_hf_retries})...")
+                        time.sleep(min(est_time, 10.0))
+                    else:
+                        break
+                        
+                if response:
+                    err_msg = f"HF Inference API returned status {response.status_code}: {response.text}"
+                    logger.warning(err_msg)
+                    _log_error_to_redis(err_msg)
+            except Exception as e:
+                err_msg = f"HF Inference API failed: {e}"
+                logger.warning(err_msg)
+                _log_error_to_redis(err_msg)
+            
+        if self.local_model is None:
+            if not self.fallback_to_local:
+                logger.error("HF Inference API failed and local fallback is disabled on Render to prevent OOM. Returning None.")
+                return None
+            logger.info("Loading local SentenceTransformer model...")
+            from sentence_transformers import SentenceTransformer
+            device = _get_sbert_device()
+            self.local_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+            
+        embeddings = self.local_model.encode(texts, show_progress_bar=show_progress_bar)
+        if single:
+            return embeddings[0] if hasattr(embeddings, '__len__') else embeddings
+        return embeddings
+
 _search_model = None
 
 def _get_search_model():
     global _search_model
     if _search_model is None:
-        from sentence_transformers import SentenceTransformer
-        device = _get_sbert_device()
-        logger.info("Initializing SentenceTransformer search model lazily on device=%s...", device)
-        _search_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+        _search_model = HFInferenceEmbeddingModel()
     return _search_model
 
 
@@ -99,7 +192,15 @@ def search_chunks(job_id: str, query: str, top_k: int = 10) -> list[dict]:
         logger.error("Embedding model not available for search")
         return []
         
-    query_vector = model.encode(query).tolist()
+    try:
+        query_vector = model.encode(query)
+        if query_vector is None:
+            logger.warning("Embedding failed, falling back to keyword search")
+            return keyword_search_chunks(job_id=job_id, keywords=query.split(), limit=top_k)
+        query_vector = query_vector.tolist()
+    except Exception as e:
+        logger.error(f"Embedding encoding failed: {e}, falling back to keyword search")
+        return keyword_search_chunks(job_id=job_id, keywords=query.split(), limit=top_k)
     
     query_filter = Filter(
         must=[
